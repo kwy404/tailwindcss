@@ -8,13 +8,21 @@ import { cartesian } from './cartesian'
 import type { CanonicalizeOptions } from './intellisense'
 import plugin from './plugin'
 import { DefaultMap } from './utils/default-map'
+import { LRUDefaultMap } from './utils/lru-default-map'
 
 const css = String.raw
 const timeout = 25_000
 const defaultTheme = fs.readFileSync(path.resolve(__dirname, '../theme.css'), 'utf8')
 
+// Each design system uses ~30MB of memory, so we only keep the most recently
+// used ones. Keeping all of them runs out of memory on CI.
+//
+// Every strategy below cycles through the same ~30 inputs, so a smaller cache
+// evicts each design system right before it is used again.
+const MAX_CACHED_DESIGN_SYSTEMS = 32
+
 const designSystems = new DefaultMap((base: string) => {
-  return new DefaultMap((input: string) => {
+  return new LRUDefaultMap(MAX_CACHED_DESIGN_SYSTEMS, (input: string) => {
     return __unstable__loadDesignSystem(input, {
       base,
       async loadStylesheet() {
@@ -1456,6 +1464,93 @@ describe('options', () => {
 })
 
 describe('regressions', () => {
+  // https://github.com/tailwindlabs/tailwindcss/issues/20539
+  test(
+    'collapsing keeps the winning candidate instead of a theme value that only matches by default',
+    { timeout },
+    async () => {
+      let designSystem = await designSystems.get(__dirname).get(css`
+        @import 'tailwindcss';
+
+        @theme {
+          --color-foreground: black;
+          --color-primary: red;
+          --color-card-checked-border: red;
+        }
+      `)
+
+      let options: CanonicalizeOptions = {
+        collapse: true,
+        logicalToPhysical: true,
+        rem: 16,
+      }
+
+      expect(
+        designSystem.canonicalizeCandidates(['text-foreground', 'text-primary'], options),
+      ).toEqual(['text-primary'])
+
+      // The candidate that wins in the CSS stays, not the first one in the input
+      expect(
+        designSystem.canonicalizeCandidates(['text-card-checked-border', 'text-primary'], options),
+      ).toEqual(['text-primary'])
+
+      // An existing candidate that wins in the CSS stays, also when it is a
+      // theme value
+      expect(
+        designSystem.canonicalizeCandidates(['text-[red]', 'text-card-checked-border'], options),
+      ).toEqual(['text-card-checked-border'])
+    },
+  )
+
+  test(
+    'collapsing does not replace a theme variable with another one that only matches by default',
+    { timeout },
+    async () => {
+      let designSystem = await designSystems.get(__dirname).get(css`
+        @import 'tailwindcss';
+
+        @theme {
+          --spacing-card: 1rem;
+          --spacing-other: 1rem;
+        }
+      `)
+
+      let options: CanonicalizeOptions = {
+        collapse: true,
+        logicalToPhysical: true,
+        rem: 16,
+      }
+
+      // The same theme variable is kept, instead of `--spacing`
+      expect(designSystem.canonicalizeCandidates(['mt-card', 'mb-card'], options)).toEqual([
+        'my-card',
+      ])
+      expect(designSystem.canonicalizeCandidates(['w-card', 'h-card'], options)).toEqual([
+        'size-card',
+      ])
+
+      // Different theme variables are not collapsed
+      expect(designSystem.canonicalizeCandidates(['mt-card', 'mb-other'], options)).toEqual([
+        'mt-card',
+        'mb-other',
+      ])
+      expect(designSystem.canonicalizeCandidates(['w-card', 'h-other'], options)).toEqual([
+        'w-card',
+        'h-other',
+      ])
+      expect(designSystem.canonicalizeCandidates(['mt-card', 'mb-4'], options)).toEqual([
+        'mt-card',
+        'mb-4',
+      ])
+
+      // `px-other` wins for the inline sides, so `p-card` alone is not the same
+      expect(designSystem.canonicalizeCandidates(['p-card', 'px-other'], options)).toEqual([
+        'p-card',
+        'px-other',
+      ])
+    },
+  )
+
   // https://github.com/schoero/eslint-plugin-better-tailwindcss/issues/321
   {
     test('a subset of classes should be canonicalizable', { timeout }, async () => {
@@ -1500,6 +1595,76 @@ describe('regressions', () => {
       ])
     })
   }
+
+  // https://github.com/tailwindlabs/tailwindcss/issues/20557
+  test(
+    'collapse does not try every combination of candidates linked by a utility that sets many properties',
+    { timeout },
+    async () => {
+      let designSystem = await designSystems.get(__dirname).get(css`
+        @import 'tailwindcss';
+
+        @utility pill {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+          height: 2rem;
+          padding: 0.25rem 0.75rem;
+          margin: 0;
+          border-radius: 9999px;
+          font-size: 0.875rem;
+          line-height: 1.25rem;
+          font-weight: 500;
+          color: white;
+          background-color: black;
+          white-space: nowrap;
+          overflow: hidden;
+          cursor: pointer;
+        }
+      `)
+
+      // Every candidate sets a property that `sr-only`, `not-sr-only` or
+      // `pill` also sets, so they used to end up in one group of linked
+      // candidates. Trying every combination of 2^n candidates of that group
+      // took tens of seconds.
+      let candidates = [
+        'relative',
+        'mt-1',
+        'mr-2',
+        'mb-3',
+        'ml-4',
+        'pt-1',
+        'pr-2',
+        'pb-3',
+        'pl-4',
+        'w-64',
+        'h-10',
+        'overflow-x-auto',
+        'overflow-y-hidden',
+        'whitespace-nowrap',
+        'flex',
+        'items-center',
+        'gap-2.5',
+        'rounded-full',
+        'bg-white',
+        'cursor-pointer',
+        'font-normal',
+        'text-sm',
+        'leading-5',
+      ]
+
+      let start = performance.now()
+      let result = designSystem.canonicalizeCandidates(candidates, DEFAULT_CANONICALIZATION_OPTIONS)
+      let duration = performance.now() - start
+
+      expect(result).toEqual([
+        ...candidates.filter((candidate) => candidate !== 'text-sm' && candidate !== 'leading-5'),
+        'text-sm/5',
+      ])
+      expect(duration).toBeLessThan(5_000)
+    },
+  )
 
   // https://github.com/tailwindlabs/tailwindcss/pull/19727
   test(
@@ -1619,6 +1784,111 @@ describe('regressions', () => {
     },
   )
 
+  test(
+    'does not crash when a plugin utility throws for one of the candidates during collapse',
+    { timeout },
+    async () => {
+      let designSystem = await __unstable__loadDesignSystem(
+        css`
+          @import 'tailwindcss';
+          @plugin "./plugin.js";
+        `,
+        {
+          async loadStylesheet(_, base) {
+            return {
+              base,
+              path: '',
+              content: '@tailwind utilities;',
+            }
+          },
+          async loadModule() {
+            return {
+              base: '',
+              path: '',
+              module: plugin(({ matchUtilities }) => {
+                matchUtilities(
+                  {
+                    boom: (value) => {
+                      if (value === 'bad') {
+                        throw new Error('Mimic as-if a custom plugin failed for some reason')
+                      }
+                      return { color: value }
+                    },
+                  },
+                  { values: { bad: 'bad', good: 'red' } },
+                )
+              }),
+            }
+          },
+        },
+      )
+
+      expect(
+        designSystem.canonicalizeCandidates(['boom-bad', 'mt-[1px]', 'mb-[1px]'], {
+          collapse: true,
+          logicalToPhysical: true,
+          rem: 16,
+        }),
+      ).toEqual(['boom-bad', 'my-px'])
+    },
+  )
+
+  test(
+    'does not crash when only another meaning of a linked candidate throws during collapse',
+    { timeout },
+    async () => {
+      let designSystem = await __unstable__loadDesignSystem(
+        css`
+          @import 'tailwindcss';
+          @plugin "./plugin.js";
+        `,
+        {
+          async loadStylesheet(_, base) {
+            return {
+              base,
+              path: '',
+              content: '@tailwind utilities;',
+            }
+          },
+          async loadModule() {
+            return {
+              base: '',
+              path: '',
+              module: plugin(({ addUtilities, matchUtilities }) => {
+                // The static `boom-bad` compiles, so it is linked to `safe`
+                addUtilities({
+                  '.boom-bad': { color: 'red' },
+                  '.safe': { color: 'red' },
+                })
+
+                // The functional `boom-bad` throws
+                matchUtilities(
+                  {
+                    boom: (value) => {
+                      if (value === 'bad') {
+                        throw new Error('Mimic as-if a custom plugin failed for some reason')
+                      }
+                      return { color: value }
+                    },
+                  },
+                  { values: { bad: 'bad', good: 'red' } },
+                )
+              }),
+            }
+          },
+        },
+      )
+
+      expect(
+        designSystem.canonicalizeCandidates(['boom-bad', 'safe', 'mt-[1px]', 'mb-[1px]'], {
+          collapse: true,
+          logicalToPhysical: true,
+          rem: 16,
+        }),
+      ).toEqual(['boom-bad', 'safe', 'my-px'])
+    },
+  )
+
   // https://github.com/tailwindlabs/tailwindcss-intellisense/issues/1579
   test('does not suggest invalid alternative when canonicalizing calc expressions', async () => {
     let designSystem = await designSystems.get(__dirname).get(css`
@@ -1703,6 +1973,34 @@ describe('regressions', () => {
     expect(
       designSystem.canonicalizeCandidates(['text-foreground/60', 'text-default-soft-hover']),
     ).toEqual(['text-foreground/60', 'text-default-soft-hover'])
+  })
+
+  test('keeps `--tw-*` declarations that are not related to a sibling with the same value', async () => {
+    let designSystem = await __unstable__loadDesignSystem(
+      css`
+        @tailwind utilities;
+        @theme {
+          --spacing: 0.25rem;
+        }
+        @utility link {
+          margin-top: 16px;
+          --tw-translate-x: 16px;
+        }
+      `,
+      { base: __dirname },
+    )
+
+    let options: CanonicalizeOptions = { rem: 16, collapse: true }
+
+    // `--tw-translate-x` is not related to `margin-top`, so `link` and `mt-4`
+    // are not the same, even though both values are `16px`.
+    expect(designSystem.canonicalizeCandidates(['link', 'mt-4'], options)).toEqual(['link', 'mt-4'])
+    expect(
+      designSystem.canonicalizeCandidates(
+        ['link', 'mt-[16px]', '[--tw-translate-x:16px]'],
+        options,
+      ),
+    ).toEqual(['link', 'mt-4'])
   })
 })
 
